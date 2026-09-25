@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Cruce Diésel Rocket</title>
+</head>
+<body>
+<div id="dc-root">
+  <div id="dc-bar">
+    <span class="dc-title">Cruce Diésel — Registro vs. MyGeotab</span>
+    <label>Desde <input type="date" id="dc-from"></label>
+    <label>Hasta <input type="date" id="dc-to"></label>
+    <button id="dc-run">Analizar</button>
+    <span id="dc-status"></span>
+  </div>
+  <div id="dc-kpis"></div>
+  <div id="dc-tabs"></div>
+  <div id="dc-panels"></div>
+  <div id="dc-foot">Merma = litros despachados (registro Drive) − litros quemados por el motor (ECU MyGeotab, diagnóstico DiagnosticDeviceTotalFuelId). Distancia = suma de Trip. Ruido normal ≈ 300–400 L.</div>
+</div>
+
+<script>
+if (typeof window.geotab === 'undefined') { window.geotab = {}; }
+if (typeof window.geotab.addin === 'undefined') { window.geotab.addin = {}; }
+window.geotab.addin.dieselCruce = function () {
+  'use strict';
+
+  /* ====== CONFIGURAR ESTO ====== */
+  var APPS_SCRIPT_URL = 'PEGAR_AQUI_LA_URL_/exec_DEL_APPS_SCRIPT';
+  var FUEL_DIAG = 'DiagnosticDeviceTotalFuelId';   // combustible acumulado (L), verificado en rocket_mx
+  /* Mapa de respaldo unidad(registro) -> prefijo nombre en Geotab. El JSON del
+     Apps Script también lo trae en "mapa_geotab" y tiene prioridad. */
+  var MAP_FALLBACK = {
+    TR08:'T08',TR10:'T10',TR14:'T14',TR15:'T15',TR16:'T16',TR17:'T17',
+    TR32:'T32',TR33:'T33',TR34:'T34',TR37:'T37',R13:'R13',R38:'R38',
+    V35:'V35',V36:'V36',V20:'V20'
+  };
+  /* ============================= */
+
+  var api, elStatus, tank = null, devByName = [];
+
+  function initialize(freshApi, freshState, callback) {
+    api = freshApi;
+    injectCSS();
+    var today = new Date();
+    var first = new Date(today.getFullYear(), today.getMonth(), 1);
+    document.getElementById('dc-from').value = iso_(first);
+    document.getElementById('dc-to').value = iso_(today);
+    elStatus = document.getElementById('dc-status');
+    document.getElementById('dc-run').addEventListener('click', run);
+    callback();
+  }
+  function focus(freshApi) { api = freshApi; }
+  function blur() {}
+
+  /* ---------- flujo principal ---------- */
+  function run() {
+    var from = document.getElementById('dc-from').value;
+    var to   = document.getElementById('dc-to').value;
+    if (!from || !to) { setStatus('Selecciona el rango de fechas.'); return; }
+    setStatus('Leyendo registro de Drive…');
+    fetchTank(from, to)
+      .then(function (t) {
+        tank = t;
+        if (t.error) throw new Error('Apps Script: ' + t.error);
+        setStatus('Consultando MyGeotab…');
+        return loadDevices();
+      })
+      .then(function () { return loadGeotab(from, to); })
+      .then(function (geo) {
+        setStatus('');
+        render(merge(tank, geo));
+      })
+      .catch(function (e) { setStatus('Error: ' + e.message); console.error(e); });
+  }
+
+  function fetchTank(from, to) {
+    var url = APPS_SCRIPT_URL + '?from=' + from + '&to=' + to;
+    return fetch(url, { method: 'GET' }).then(function (r) { return r.json(); });
+  }
+
+  function loadDevices() {
+    return callP('Get', { typeName: 'Device', resultsLimit: 5000,
+                          propertySelector: { fields: ['id', 'name'] } })
+      .then(function (devs) {
+        devByName = devs.map(function (d) { return { id: d.id, name: (d.name || '').trim() }; });
+      });
+  }
+
+  function findDeviceId(prefix) {
+    // primer dispositivo cuyo nombre empieza con el prefijo (ignora sufijos/espacios)
+    var p = prefix.toUpperCase();
+    var hit = devByName.filter(function (d) { return d.name.toUpperCase().indexOf(p) === 0; });
+    return hit.length ? hit[0].id : null;
+  }
+
+  function loadGeotab(from, to) {
+    var map = (tank && tank.mapa_geotab) ? tank.mapa_geotab : MAP_FALLBACK;
+    var fromISO = from + 'T00:00:00.000Z';
+    var toISO   = to   + 'T23:59:59.000Z';
+    // ventanas estrechas para los extremos del combustible acumulado
+    var startTo = addDays_(from, 4) + 'T00:00:00.000Z';
+    var endFrom = addDays_(to, -4)  + 'T00:00:00.000Z';
+
+    var units = Object.keys(map);
+    var calls = [], meta = [];
+    units.forEach(function (u) {
+      var devId = findDeviceId(map[u]);
+      if (!devId) { meta.push({ u: u, devId: null }); return; }
+      meta.push({ u: u, devId: devId });
+      // distancia (suma de Trip)
+      calls.push(['Get', { typeName: 'Trip',
+        search: { deviceSearch: { id: devId }, fromDate: fromISO, toDate: toISO },
+        propertySelector: { fields: ['distance'] }, resultsLimit: 50000 }]);
+      // combustible: extremo inicial
+      calls.push(['Get', { typeName: 'StatusData',
+        search: { deviceSearch: { id: devId }, diagnosticSearch: { id: FUEL_DIAG },
+                  fromDate: fromISO, toDate: startTo }, resultsLimit: 5000 }]);
+      // combustible: extremo final
+      calls.push(['Get', { typeName: 'StatusData',
+        search: { deviceSearch: { id: devId }, diagnosticSearch: { id: FUEL_DIAG },
+                  fromDate: endFrom, toDate: toISO }, resultsLimit: 5000 }]);
+    });
+
+    return callP('multi', calls).then(function (res) {
+      var out = {}, i = 0;
+      meta.forEach(function (m) {
+        if (!m.devId) { out[m.u] = { km: null, ecu: null, sinGps: true }; return; }
+        var trips = res[i++], fs = res[i++], fe = res[i++];
+        var km = (trips || []).reduce(function (s, t) { return s + (t.distance || 0); }, 0);
+        var ecu = fuelDelta(fs, fe);
+        out[m.u] = { km: round0(km), ecu: (ecu == null ? null : round0(ecu)) };
+      });
+      return out;
+    });
+  }
+
+  function fuelDelta(startArr, endArr) {
+    var minStart = pick(startArr, Math.min);
+    var maxEnd   = pick(endArr,   Math.max);
+    if (minStart == null || maxEnd == null) return null;
+    return maxEnd - minStart;
+  }
+  function pick(arr, fn) {
+    if (!arr || !arr.length) return null;
+    return arr.reduce(function (acc, s) {
+      var v = (typeof s.data === 'number') ? s.data : null;
+      if (v == null) return acc;
+      return acc == null ? v : fn(acc, v);
+    }, null);
+  }
+
+  /* ---------- cruce ---------- */
+  function merge(tankData, geo) {
+    var map = tankData.mapa_geotab || MAP_FALLBACK;
+    var byU = {};
+    (tankData.rocket || []).forEach(function (r) { byU[r.unidad] = r; });
+    var rows = Object.keys(map).map(function (u) {
+      var t = byU[u] || { L_total: 0, categoria: '' };
+      var g = geo[u] || { km: null, ecu: null };
+      var disp = t.L_total || 0;
+      var merma = (g.ecu != null) ? Math.round(disp - g.ecu) : null;
+      var mp = (merma != null && disp) ? +(merma / disp * 100).toFixed(1) : null;
+      var rend = (g.km != null && disp) ? +(g.km / disp).toFixed(2) : null;
+      return { u: u, cat: t.categoria || '', Ldisp: Math.round(disp), km: g.km, ecu: g.ecu,
+               rend: rend, merma: merma, merma_pct: mp, sev: sev(t.categoria, merma, mp, g) };
+    }).filter(function (r) { return r.Ldisp > 0 || r.km; });
+    rows.sort(function (a, b) { return (b.merma == null ? -1e9 : b.merma) - (a.merma == null ? -1e9 : a.merma); });
+    return { rows: rows, tank: tankData };
+  }
+  function sev(cat, m, mp, g) {
+    if (g && g.sinGps) return 'nogeo';
+    if (cat === 'VAN' || (g && g.ecu == null)) return 'sensor';
+    if (m == null) return 'nogeo';
+    if (m > 500 && mp != null && mp > 10) return 'critico';
+    if (m >= 300) return 'vigilar';
+    if (m < -100) return 'externa';
+    return 'ok';
+  }
+
+  /* ---------- render ---------- */
+  function render(model) {
+    var rows = model.rows, tk = model.tank;
+    var crit = rows.filter(function (r) { return r.sev === 'critico'; });
+    var warn = rows.filter(function (r) { return r.sev === 'vigilar'; });
+    var flagged = rows.filter(function (r) { return ['critico', 'vigilar'].indexOf(r.sev) >= 0 && r.merma > 0; })
+                      .reduce(function (s, r) { return s + r.merma; }, 0);
+    var price = tk.tank_cost_per_l || 23.04;
+
+    var kpis = [
+      ['Foco crítico', crit.length ? crit.map(function (r) { return r.u; }).join(', ') : '—'],
+      ['A vigilar', warn.length ? warn.map(function (r) { return r.u; }).join(', ') : '—'],
+      ['Merma marcada', num(flagged) + ' L'],
+      ['≈ Valor', money(flagged * price)]
+    ];
+    document.getElementById('dc-kpis').innerHTML = kpis.map(function (k) {
+      return '<div class="dc-kpi"><div class="v">' + k[1] + '</div><div class="l">' + k[0] + '</div></div>';
+    }).join('');
+
+    var TABS = [
+      ['focos', 'Focos rojos', function () { return focosHTML(crit, warn, tk, price); }],
+      ['cruce', 'Cruce por unidad', function () { return cruceHTML(rows, price); }],
+      ['consumo', 'Consumo', function () { return consumoHTML(tk); }],
+      ['tanque', 'Tanque', function () { return tanqueHTML(tk); }],
+      ['tte', 'TTE', function () { return tteHTML(tk); }]
+    ];
+    document.getElementById('dc-tabs').innerHTML = TABS.map(function (t, i) {
+      return '<button class="dc-tab' + (i === 0 ? ' active' : '') + '" data-k="' + t[0] + '">' + t[1] + '</button>';
+    }).join('');
+    document.getElementById('dc-panels').innerHTML = TABS.map(function (t, i) {
+      return '<div class="dc-panel' + (i === 0 ? ' active' : '') + '" id="dcp-' + t[0] + '">' + t[2]() + '</div>';
+    }).join('');
+    var tabsEl = document.getElementById('dc-tabs');
+    tabsEl.onclick = function (e) {
+      var b = e.target.closest ? e.target.closest('.dc-tab') : null; if (!b) return;
+      [].forEach.call(document.querySelectorAll('.dc-tab'), function (x) { x.classList.remove('active'); });
+      [].forEach.call(document.querySelectorAll('.dc-panel'), function (x) { x.classList.remove('active'); });
+      b.classList.add('active'); document.getElementById('dcp-' + b.getAttribute('data-k')).classList.add('active');
+    };
+  }
+
+  var badge = function (s) {
+    var m = { critico:['Crítico','c'], vigilar:['Vigilar','w'], ok:['OK','o'],
+              sensor:['Sensor van','g'], externa:['Carga externa?','b'], nogeo:['Sin GPS','g'] };
+    var x = m[s] || [s, 'o']; return '<span class="dc-b dc-b-' + x[1] + '">' + x[0] + '</span>';
+  };
+  function focosHTML(crit, warn, tk, price) {
+    var h = '<div class="dc-card"><h3>Focos rojos y acciones</h3>';
+    crit.forEach(function (g) {
+      h += flag('c', g.u + ' — ' + num(g.merma) + ' L (' + pct(g.merma_pct) + ') · ~' + money(g.merma * price),
+        'Despachados ' + num(g.Ldisp) + ' L vs. ' + num(g.ecu) + ' L quemados. Rend. real ' + f2(g.rend) +
+        ' km/L. Auditar operador, rutas y despacho.');
+    });
+    if (warn.length) {
+      var tot = warn.reduce(function (s, g) { return s + g.merma; }, 0);
+      h += flag('w', 'A vigilar: ' + warn.map(function (g) { return g.u + ' +' + num(g.merma) + ' L'; }).join(' · '),
+        'En conjunto ' + num(tot) + ' L (~' + money(tot * price) + '). Monitorear tendencia.');
+    }
+    var rec = tk.recon || {};
+    Object.keys(rec).forEach(function (m) {
+      if (rec[m].falt > 200)
+        h += flag('w', 'Tanque mes ' + m + ': faltante de ' + num(rec[m].falt) + ' L',
+          'La bomba despachó ' + num(rec[m].falt) + ' L más de lo ticketeado. Reforzar registro de despacho.');
+    });
+    if ((tk.odo_errores || []).length)
+      h += flag('w', tk.odo_errores.length + ' errores de odómetro', 'Captura manual con saltos imposibles. Usar Geotab como fuente oficial.');
+    return h + '</div>';
+  }
+  function flag(kind, head, det) {
+    return '<div class="dc-flag ' + kind + '"><div class="h">' + head + '</div><div class="d">' + det + '</div></div>';
+  }
+  function cruceHTML(rows, price) {
+    var head = ['Unidad', 'Cat', 'Despachado L', 'km Geotab', 'Motor ECU L', 'Rend km/L', 'Merma L', '%', 'Estado'];
+    var body = rows.map(function (r) {
+      return tr([r.u, r.cat, num(r.Ldisp), num(r.km), num(r.ecu), f2(r.rend), num(r.merma), pct(r.merma_pct), badge(r.sev)],
+                r.sev === 'critico' ? 'c' : (r.sev === 'vigilar' ? 'w' : ''));
+    }).join('');
+    return card('Cruce por unidad (registro vs. MyGeotab)', table(head, body));
+  }
+  function consumoHTML(tk) {
+    var head = ['Unidad', 'Categoría', 'Cargas', 'L tanque', 'L externo', 'L TOTAL', 'Costo $'];
+    var rocket = (tk.rocket || []).slice().sort(function (a, b) { return b.L_total - a.L_total; });
+    var body = rocket.map(function (r) {
+      return tr([r.unidad, r.categoria, num(r.cargas), num(r.L_tanque), num(r.L_externo), num(r.L_total), money(r.costo_total)], '');
+    }).join('');
+    return card('Consumo por unidad (registro)', table(head, body));
+  }
+  function tanqueHTML(tk) {
+    var head = ['Mes', 'Bomba L', 'Ticketeado L', 'Faltante L', 'Lectura'];
+    var rec = tk.recon || {};
+    var body = Object.keys(rec).map(function (m) {
+      var x = rec[m]; var w = x.falt > 200;
+      return tr([x.mes, num(x.pump), num(x.tank_log), num(x.falt), w ? 'Revisar' : 'Cuadra'], w ? 'w' : '');
+    }).join('');
+    return card('Reconciliación del tanque — bomba vs. tickets', table(head, body));
+  }
+  function tteHTML(tk) {
+    var head = ['Unidad', 'Cargas', 'Litros', 'Facturado $', '$/L', 'A costo $', 'Dif.'];
+    var body = (tk.tte || []).map(function (t) {
+      return tr([t.unidad, num(t.cargas), num(t.L_total), money(t.costo_total), f2(t.precio_prom), money(t.a_costo), money(t.dif)],
+                (t.precio_prom != null && t.precio_prom < (tk.tank_cost_per_l - 0.1)) ? 'w' : '');
+    }).join('');
+    var tt = tk.tte_tot || { litros: 0, fact: 0, costo: 0 };
+    return card('TTE (tercero) — Total ' + num(tt.litros) + ' L · facturado ' + money(tt.fact) + ' · a costo ' + money(tt.costo),
+                table(head, body));
+  }
+
+  /* ---------- helpers UI ---------- */
+  function card(t, inner) { return '<div class="dc-card"><h3>' + t + '</h3>' + inner + '</div>'; }
+  function table(head, body) {
+    return '<div class="dc-tblwrap"><table><thead><tr>' +
+      head.map(function (h) { return '<th>' + h + '</th>'; }).join('') +
+      '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }
+  function tr(cells, cls) {
+    return '<tr class="' + (cls || '') + '">' + cells.map(function (c, i) {
+      return '<td class="' + (i === 0 ? 'u' : '') + '">' + (c == null ? '—' : c) + '</td>';
+    }).join('') + '</tr>';
+  }
+  function setStatus(s) { if (elStatus) elStatus.textContent = s; }
+
+  /* ---------- helpers Geotab / promesas ---------- */
+  function callP(kind, arg) {
+    return new Promise(function (resolve, reject) {
+      if (kind === 'multi') api.multiCall(arg, resolve, reject);
+      else api.call(kind, arg, resolve, reject);
+    });
+  }
+
+  /* ---------- format ---------- */
+  function num(n) { return n == null ? '—' : Math.round(n).toLocaleString('es-MX'); }
+  function money(n) { return n == null ? '—' : '$' + Math.round(n).toLocaleString('es-MX'); }
+  function f2(n) { return n == null ? '—' : n.toFixed(2); }
+  function pct(n) { return n == null ? '—' : n.toFixed(1) + '%'; }
+  function round0(n) { return Math.round(n); }
+  function iso_(d) { return d.toISOString().slice(0, 10); }
+  function addDays_(s, n) { var d = new Date(s + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+
+  /* ---------- CSS inyectado vía JS (los <style> se eliminan al inyectar el add-in) ---------- */
+  function injectCSS() {
+    var css = [
+      '#dc-root{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1f2733;padding:12px;font-size:14px}',
+      '#dc-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}',
+      '#dc-bar .dc-title{font-weight:700;font-size:15px;margin-right:8px;color:#1f3864}',
+      '#dc-bar input{padding:5px 7px;border:1px solid #cfd6e4;border-radius:7px}',
+      '#dc-run{background:#2e5496;color:#fff;border:0;border-radius:7px;padding:7px 16px;font-weight:600;cursor:pointer}',
+      '#dc-status{color:#647089;font-size:13px}',
+      '#dc-kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}',
+      '.dc-kpi{background:#fff;border:1px solid #e2e7f0;border-radius:11px;padding:10px 14px;min-width:130px}',
+      '.dc-kpi .v{font-size:18px;font-weight:800}.dc-kpi .l{font-size:11px;color:#647089;margin-top:2px}',
+      '#dc-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}',
+      '.dc-tab{border:1px solid #e2e7f0;background:#fff;color:#647089;padding:7px 13px;border-radius:999px;font-size:13px;cursor:pointer;font-weight:600}',
+      '.dc-tab.active{background:#2e5496;color:#fff;border-color:#2e5496}',
+      '.dc-panel{display:none}.dc-panel.active{display:block}',
+      '.dc-card{background:#fff;border:1px solid #e2e7f0;border-radius:13px;padding:15px;margin-bottom:12px}',
+      '.dc-card h3{font-size:14px;margin:0 0 10px}',
+      '.dc-flag{border-radius:11px;padding:11px 13px;margin-bottom:8px;border:1px solid #e2e7f0}',
+      '.dc-flag.c{background:#fdeaec}.dc-flag.w{background:#fbf1e0}',
+      '.dc-flag .h{font-weight:700;font-size:13.5px}.dc-flag .d{font-size:12.5px;color:#3b4557;margin-top:3px}',
+      '.dc-tblwrap{overflow-x:auto}',
+      'table{border-collapse:collapse;width:100%;font-size:12.5px;min-width:520px}',
+      'th,td{padding:8px 9px;text-align:right;border-bottom:1px solid #eef1f7;white-space:nowrap}',
+      'th:first-child,td:first-child{text-align:left}',
+      'th{color:#647089;font-size:11px;text-transform:uppercase;letter-spacing:.3px}',
+      'td.u{font-weight:700}',
+      'tr.c td{background:#fdeaec}tr.w td{background:#fbf1e0}',
+      '.dc-b{display:inline-block;font-size:10px;font-weight:800;padding:2px 7px;border-radius:999px;color:#fff;text-transform:uppercase}',
+      '.dc-b-c{background:#d64550}.dc-b-w{background:#c9791f}.dc-b-o{background:#2f9e6f}.dc-b-g{background:#8b95a8}.dc-b-b{background:#2e5496}',
+      '#dc-foot{color:#647089;font-size:11px;margin-top:10px;border-top:1px solid #e2e7f0;padding-top:10px}'
+    ].join('\n');
+    var s = document.createElement('style');
+    s.type = 'text/css';
+    s.appendChild(document.createTextNode(css));
+    document.head.appendChild(s);
+  }
+
+  return { initialize: initialize, focus: focus, blur: blur };
+};
+</script>
+</body>
+</html>
